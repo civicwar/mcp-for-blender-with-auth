@@ -1,16 +1,16 @@
 """Opt-in AST allowlist for scripts sent through `execute_blender_code`.
 
-`execute_code` on the Blender socket is arbitrary code execution inside the
-user's Blender process — that is the product feature, so by default nothing is
-validated. Setting BLENDER_MCP_SAFE_MODE=1 turns on this validator in the MCP
+Authenticated `execute_code` on the Blender socket is arbitrary code execution
+inside the user's Blender process. Authentication is always required; setting
+BLENDER_MCP_SAFE_MODE=1 additionally turns on this validator in the MCP
 server, so a script authored by the model must clear it before a byte crosses
 the socket. The threat it addresses is prompt injection: third-party text
 (asset names and descriptions from Poly Haven, Sketchfab, Hyper3D) flows into
 the model's context, and injected instructions could steer the model into
 writing hostile code that a user approves without reading.
 
-Scope is the honest limitation: the addon's socket accepts a raw
-`execute_code` from any local process, so this guard covers the MCP path only.
+Scope is the honest limitation: another client with the shared secret can send
+raw `execute_code` to the addon's socket, so this guard covers the MCP path only.
 It is a guard on what the model can be talked into, not a sandbox around
 Blender.
 

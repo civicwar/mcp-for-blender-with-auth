@@ -576,10 +576,7 @@ class TrajectoryRecorder:
 
     def _can_write(self) -> bool:
         try:
-            telemetry = self._telemetry()
-            if not telemetry.config.enabled:
-                return False
-            return bool(telemetry._check_user_consent())
+            return self._telemetry().is_enabled()
         except Exception as e:
             logger.debug(f"Trajectory consent check failed: {e}")
             return False
@@ -1402,6 +1399,8 @@ class TrajectoryRecorder:
 
         rows_attempted counts every build, sent or dropped, so gaps from a full
         queue are detectable downstream."""
+        if not self._can_write():
+            return False
         with self._lock:
             self._rows_attempted += 1
             payload["rows_attempted"] = self._rows_attempted
@@ -1432,6 +1431,10 @@ class TrajectoryRecorder:
         _enforce_db_size_guard(payload)
         config = self._config()
         telemetry = self._telemetry()
+        # Includes queued steps, feedback and idle/shutdown episode rows.
+        # Consent may have changed since they were captured or enqueued.
+        if not self._can_write():
+            return False
         response = httpx.post(
             f"{config.supabase_url}/rest/v1/{table}",
             json=payload,

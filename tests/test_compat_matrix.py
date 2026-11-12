@@ -1,10 +1,13 @@
-"""Any server must work with any addon.
+"""Command-level compatibility across add-on versions.
 
 The server updates itself through uvx; the addon only changes when the user
 reinstalls it. So this runs the model-facing tools against real addons from
 this repository's history - each one's actual command table and execute_code
 behaviour, read from its source - and pins the other direction too: today's
 addon still answers every command a released server sends.
+
+These fakes bypass the socket layer. Historical unauthenticated transports are
+intentionally refused by this fork; test_socket_auth covers that boundary.
 """
 
 import ast

@@ -29,18 +29,19 @@ from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
 bl_info = {
-    "name": "MCP for Blender",
+    "name": "mcp-for-blender-with-auth",
     "author": "Siddharth Ahuja",
-    "version": (1, 8),
+    "version": (1, 9),
     "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > MCP for Blender",
-    "description": "Connect Blender to Claude via MCP",
-    "doc_url": "https://mcp-for-blender.com/",
+    "location": "View3D > Sidebar > mcp-for-blender-with-auth",
+    "description": "Connect Blender to MCP clients with required shared-secret authentication",
+    "doc_url": "https://github.com/civicwar/mcp-for-blender-with-auth/blob/main/docs/authentication.md",
     "category": "Interface",
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 15
+ADDON_PROTOCOL_VERSION = 16
+AUTH_PROTOCOL_VERSION = 1
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -103,6 +104,20 @@ TRIPO_TIMEOUT = (10, 60)
 _user_stopped_server = False
 
 
+def _blendermcp_auth_token(context=None):
+    """Resolve on the main thread; never read credentials from a .blend scene."""
+    token = os.environ.get("BLENDER_MCP_AUTH_TOKEN")
+    if token is None:
+        prefs = get_blendermcp_addon_preferences(context)
+        token = getattr(prefs, "auth_token", "")
+    if not isinstance(token, str) or not re.fullmatch(r"[!-~]{32,256}", token):
+        raise ValueError(
+            "Authentication is required. Set a random 32-256 character ASCII "
+            "secret without spaces in Auth Token or BLENDER_MCP_AUTH_TOKEN."
+        )
+    return token
+
+
 def _blendermcp_bind_address(context=None):
     """Read persistent listener settings, requiring opt-in beyond loopback."""
     prefs = get_blendermcp_addon_preferences(context)
@@ -156,6 +171,7 @@ def _blendermcp_ensure_server_running():
 
     try:
         host = _blendermcp_bind_address()
+        _blendermcp_auth_token()
     except ValueError as exc:
         scene.blendermcp_server_running = False
         print(f"BlenderMCP: auto-start skipped: {exc}")
@@ -1019,6 +1035,13 @@ class UserEditRecorder:
         self._last_operator_count = len(self._operator_stack())
         self._seen_baseline = True
 
+    def discard(self):
+        """Forget pending edits and start a fresh baseline after an opt-out."""
+        self._events.clear()
+        self._seen_baseline = False
+        self._last_operator_count = 0
+        self._last_poll_time = 0.0
+
     def poll_operators(self, now=None):
         """Emit rows for operators run since the last poll. Main thread only.
 
@@ -1189,6 +1212,7 @@ def sync_edit_capture_handlers():
 
 
 def _unregister_edit_capture_handlers():
+    _edit_recorder.discard()
     handlers = [
         (bpy.app.handlers.undo_post, _blendermcp_undo_post),
         (bpy.app.handlers.redo_post, _blendermcp_redo_post),
@@ -1275,6 +1299,8 @@ class BlenderMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        self._auth_token = ""
+        self._auth_generation = object()
         # Commands are pushed here by client threads and drained by a single
         # timer running on Blender's main thread. bpy.app.timers is not
         # thread-safe, so registering a timer per command (the previous
@@ -1390,6 +1416,14 @@ class BlenderMCPServer:
             print("Server is already running")
             return
 
+        try:
+            # Snapshot preferences here: client threads must never touch bpy.
+            self._auth_token = _blendermcp_auth_token()
+        except ValueError as exc:
+            print(f"BlenderMCP: server not started: {exc}")
+            return
+
+        self._auth_generation = object()
         self.running = True
 
         try:
@@ -1421,6 +1455,8 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
+        self._auth_token = ""
+        self._auth_generation = None
 
         _unregister_edit_capture_handlers()
         get_edit_recorder().drain()
@@ -1518,9 +1554,14 @@ class BlenderMCPServer:
 
         while True:
             try:
-                command, client = self.command_queue.get_nowait()
+                command, client, generation = self.command_queue.get_nowait()
             except queue.Empty:
                 break
+
+            # A handler that was already receiving during stop()/restart can
+            # enqueue late. Never execute a command from a revoked generation.
+            if generation is not self._auth_generation:
+                continue
 
             try:
                 response = self.execute_command(command)
@@ -1546,27 +1587,56 @@ class BlenderMCPServer:
         with self._clients_lock:
             self._clients.add(client)
         buffer = b''
+        authenticated = False
+        auth_deadline = time.monotonic() + 5.0
+        generation = self._auth_generation
 
         try:
             while self.running:
                 # Receive data
                 try:
+                    if not authenticated and time.monotonic() >= auth_deadline:
+                        self._reject_client(client)
+                        break
                     data = client.recv(8192)
                     if not data:
                         print("Client disconnected")
                         break
 
                     buffer += data
+                    if not authenticated and (len(buffer) > 8192 or time.monotonic() >= auth_deadline):
+                        self._reject_client(client)
+                        break
                     try:
                         # Try to parse command
                         command = json.loads(buffer.decode('utf-8'))
                         buffer = b''
 
+                        # Authenticate EVERY request before dispatch, including
+                        # observation tools. Never queue, log or echo the secret.
+                        token = command.pop("auth_token", None) if isinstance(command, dict) else None
+                        if (
+                            not self._auth_token
+                            or generation is not self._auth_generation
+                            or not isinstance(token, str)
+                            or not token.isascii()
+                            or not hmac.compare_digest(token, self._auth_token)
+                        ):
+                            self._reject_client(client)
+                            break
+                        authenticated = True
+                        if command.get("type") == "authenticate":
+                            client.sendall(json.dumps({
+                                "status": "success",
+                                "result": {"authenticated": True, "auth_protocol": AUTH_PROTOCOL_VERSION},
+                            }).encode("utf-8"))
+                            continue
+
                         # Hand off to the main thread. Never call
                         # bpy.app.timers.register() from here - it is not
                         # thread-safe and the callback can be silently lost.
                         print(f"Queued command: {command.get('type')}")
-                        self.command_queue.put((command, client))
+                        self.command_queue.put((command, client, generation))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         # Incomplete data, wait for more. A multi-byte UTF-8
                         # character can land split across a recv() chunk
@@ -1589,6 +1659,14 @@ class BlenderMCPServer:
             except:
                 pass
             print("Client handler stopped")
+
+    @staticmethod
+    def _reject_client(client):
+        client.sendall(json.dumps({
+            "status": "error",
+            "code": "AUTHENTICATION_FAILED",
+            "message": "Authentication failed",
+        }).encode("utf-8"))
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
@@ -1731,6 +1809,8 @@ class BlenderMCPServer:
             "name": bl_info.get("name", "MCP for Blender"),
             "addon_version": list(bl_info.get("version", (0, 0))),
             "protocol_version": ADDON_PROTOCOL_VERSION,
+            "authentication_required": True,
+            "auth_protocol": AUTH_PROTOCOL_VERSION,
             "capabilities": sorted([
                 "get_scene_info",
                 "get_world_state_snapshot",
@@ -3579,7 +3659,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """PolyHaven integration is currently disabled. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Check the 'Use assets from Poly Haven' checkbox
                             3. Restart the connection to Claude"""
         }
@@ -3596,7 +3676,7 @@ class BlenderMCPServer:
                 return {
                     "enabled": False,
                     "message": """Hyper3D Rodin integration is currently enabled, but API key is not given. To enable it:
-                                1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                                1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Hyper3D Rodin 3D model generation' checkbox checked
                                 3. Choose the right plaform and fill in the API Key
                                 4. Restart the connection to Claude"""
@@ -3612,7 +3692,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Hyper3D Rodin integration is currently disabled. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Check the 'Use Hyper3D Rodin 3D model generation' checkbox
                             3. Restart the connection to Claude"""
             }
@@ -4009,7 +4089,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Sketchfab integration is currently enabled, but API key is not given. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Keep the 'Use Sketchfab' checkbox checked
                             3. Enter your Sketchfab API Key
                             4. Restart the connection to Claude"""
@@ -4018,7 +4098,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Sketchfab integration is currently disabled. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Check the 'Use assets from Sketchfab' checkbox
                             3. Enter your Sketchfab API Key
                             4. Restart the connection to Claude"""
@@ -4412,7 +4492,7 @@ class BlenderMCPServer:
                 "enabled": False,
                 "message": """Poly Pizza integration is currently enabled, but API key is not given. To enable it:
                             1. Get a free API key at https://poly.pizza/settings/api
-                            2. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             3. Keep the 'Use Poly Pizza' checkbox checked
                             4. Enter your Poly Pizza API Key
                             5. Restart the connection to Claude"""
@@ -4422,7 +4502,7 @@ class BlenderMCPServer:
                 "enabled": False,
                 "message": """Poly Pizza integration is currently disabled. To enable it:
                             1. Get a free API key at https://poly.pizza/settings/api
-                            2. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            2. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             3. Check the 'Use assets from Poly Pizza' checkbox
                             4. Enter your Poly Pizza API Key
                             5. Restart the connection to Claude"""
@@ -4737,7 +4817,7 @@ class BlenderMCPServer:
                             "enabled": False, 
                             "mode": hunyuan3d_mode, 
                             "message": """Hunyuan3D integration is currently enabled, but SecretId or SecretKey is not given. To enable it:
-                                1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                                1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Tencent Hunyuan 3D model generation' checkbox checked
                                 3. Choose the right platform and fill in the SecretId and SecretKey
                                 4. Restart the connection to Claude"""
@@ -4748,7 +4828,7 @@ class BlenderMCPServer:
                             "enabled": False, 
                             "mode": hunyuan3d_mode, 
                             "message": """Hunyuan3D integration is currently enabled, but API URL  is not given. To enable it:
-                                1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                                1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                                 2. Keep the 'Use Tencent Hunyuan 3D model generation' checkbox checked
                                 3. Choose the right platform and fill in the API URL
                                 4. Restart the connection to Claude"""
@@ -4766,7 +4846,7 @@ class BlenderMCPServer:
         return {
             "enabled": False, 
             "message": """Hunyuan3D integration is currently disabled. To enable it:
-                        1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                        1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                         2. Check the 'Use Tencent Hunyuan 3D model generation' checkbox
                         3. Restart the connection to Claude"""
         }
@@ -5181,7 +5261,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Tripo integration is currently disabled. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Under AI Model Generation, check Tripo
                             3. Choose a model and fill in the API Key""",
             }
@@ -5189,7 +5269,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Tripo integration is currently enabled, but the API key is not given. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Under AI Model Generation, keep Tripo checked
                             3. Choose a model and fill in the API Key""",
             }
@@ -5408,7 +5488,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Meshy integration is currently disabled. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Under AI Model Generation, check Meshy
                             3. Choose a model and fill in the API Key (needs a paid Meshy plan)""",
             }
@@ -5416,7 +5496,7 @@ class BlenderMCPServer:
             return {
                 "enabled": False,
                 "message": """Meshy integration is currently enabled, but the API key is not given. To enable it:
-                            1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                            1. In the 3D Viewport, find the mcp-for-blender-with-auth panel in the sidebar (press N if hidden)
                             2. Under AI Model Generation, keep Meshy checked
                             3. Fill in the API Key (needs a paid Meshy plan)""",
             }
@@ -5942,7 +6022,7 @@ def premium_integration_status(integration, enabled):
     label, prop = PREMIUM_INTEGRATIONS[integration]
     if not enabled:
         return {"enabled": False, "mode": "PREMIUM", "message": (
-            f"{label} is turned off. To use it through Premium, check '{label}' in the MCP for Blender "
+            f"{label} is turned off. To use it through Premium, check '{label}' in the mcp-for-blender-with-auth "
             "sidebar (press N in the 3D Viewport).")}
     result = premium_request("GET", "/status")
     if result.get("code") in {"NETWORK_ERROR", "BAD_RESPONSE"} and _premium_status.get("tier"):
@@ -6388,6 +6468,15 @@ PREMIUM_CLASSES = (
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
+    auth_token: bpy.props.StringProperty(
+        name="Auth Token",
+        subtype="PASSWORD",
+        description=(
+            "Required random shared secret (32-256 ASCII characters without spaces). "
+            "BLENDER_MCP_AUTH_TOKEN overrides this preference. Reconnect after changing it"
+        ),
+        default="",
+    )
     bind_address: bpy.props.StringProperty(
         name="Bind Address",
         description="Listener address: localhost or an IPv4 address. Applied on next connection",
@@ -6397,8 +6486,8 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         name="Allow Remote Connections",
         description=(
             "Allow non-loopback binding on the next connection. Remote clients can execute "
-            "Python without authentication or encryption. Use only on a trusted network "
-            "with firewall restrictions"
+            "Python with the shared secret. Traffic is not encrypted; use an encrypted "
+            "tunnel and firewall restrictions"
         ),
         default=False,
     )
@@ -6411,7 +6500,7 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
 
     telemetry_consent: BoolProperty(
         name="Allow Telemetry",
-        description="Opt in to collection of prompts, code snippets, screenshots, and trajectory data to help improve MCP for Blender. Off by default",
+        description="Opt in to usage counts, prompts, code, screenshots and trajectory data. Off disables all telemetry uploads. Off by default",
         default=False,
         update=_on_telemetry_consent_changed,
     )
@@ -6503,14 +6592,17 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
 
         layout.label(text="Server Connection:", icon='NETWORK_DRIVE')
         connection_box = layout.box()
+        connection_box.prop(self, "auth_token")
+        connection_box.label(text="Authentication is required; no anonymous access.", icon='LOCKED')
+        connection_box.label(text="BLENDER_MCP_AUTH_TOKEN overrides Auth Token.")
         connection_box.prop(self, "bind_address")
         connection_box.prop(self, "allow_remote_connections")
         if self.allow_remote_connections:
             warning = connection_box.column()
             warning.alert = True
             warning.label(text="Remote clients can run Python.", icon='ERROR')
-            warning.label(text="No authentication or encryption.")
-            warning.label(text="Use a trusted LAN and a firewall.")
+            warning.label(text="The shared secret and traffic are not encrypted.")
+            warning.label(text="Use an encrypted tunnel and a firewall.")
         connection_box.label(text="Disconnect and reconnect to apply changes.", icon='INFO')
         layout.separator()
 
@@ -6524,11 +6616,11 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
         # Info text
         box.separator()
         if self.telemetry_consent:
-            box.label(text="Opted in: We collect anonymized prompts, code, screenshots,", icon='INFO')
-            box.label(text="and trajectory data (actions, scene state, feedback).", icon='BLANK1')
+            box.label(text="Opted in: Usage counts, prompts, code, screenshots,", icon='INFO')
+            box.label(text="and trajectory data may be uploaded when configured.", icon='BLANK1')
         else:
-            box.label(text="Off (default): We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
+            box.label(text="Off (default): No telemetry uploads, including usage counts.", icon='INFO')
+            box.label(text="Queued uploads are discarded while this is off.", icon='BLANK1')
         box.separator()
         box.label(text="Data is not linked to your name or account. Change this anytime.", icon='CHECKMARK')
         
@@ -6574,11 +6666,11 @@ class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
 
 # Blender UI Panel
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
-    bl_label = "MCP for Blender"
+    bl_label = "mcp-for-blender-with-auth"
     bl_idname = "BLENDERMCP_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'MCP for Blender'
+    bl_category = 'mcp-for-blender-with-auth'
 
     def _integration_header(self, layout, scene, prop_name, title, icon):
         """Draw an integration as a box with a checkbox header row.
@@ -6779,6 +6871,7 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
             return {'FINISHED'}
         try:
             host = _blendermcp_bind_address(context)
+            _blendermcp_auth_token(context)
         except ValueError as exc:
             scene.blendermcp_server_running = False
             self.report({'ERROR'}, str(exc))
@@ -6796,7 +6889,9 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         # Start the server
         server.start()
         scene.blendermcp_server_running = server.running
-
+        if not server.running:
+            self.report({'ERROR'}, "Could not start the authenticated MCP server; check Blender's console")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
 # Operator to stop the server
@@ -6824,12 +6919,13 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 # The addon updates itself from the open-source repo. An update is offered only
 # when main carries a strictly newer (version, protocol), so a local build that
 # is ahead of main is never "updated" backwards.
-ADDON_UPDATE_URL = "https://raw.githubusercontent.com/ahujasid/blender-mcp/main/addon.py"
-ADDON_CHANGES_URL = "https://github.com/ahujasid/blender-mcp/commits/main/addon.py"
+ADDON_UPDATE_URL = "https://raw.githubusercontent.com/civicwar/mcp-for-blender-with-auth/main/addon.py"
+ADDON_CHANGES_URL = "https://github.com/civicwar/mcp-for-blender-with-auth/commits/main/addon.py"
 ADDON_UPDATE_CHECK_ENV = "BLENDERMCP_NO_UPDATE_CHECK"
 
 _ADDON_VERSION_RE = re.compile(r'"version":\s*\((\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)')
 _ADDON_PROTOCOL_RE = re.compile(r"^ADDON_PROTOCOL_VERSION\s*=\s*(\d+)", re.MULTILINE)
+_ADDON_AUTH_PROTOCOL_RE = re.compile(r"^AUTH_PROTOCOL_VERSION\s*=\s*(\d+)\s*$", re.MULTILINE)
 
 # status: idle | checking | current | available | installed | error
 _addon_update = {"status": "idle", "version": None, "source": None, "error": None}
@@ -6838,11 +6934,14 @@ _addon_update = {"status": "idle", "version": None, "source": None, "error": Non
 def addon_release_key(source):
     """(major, minor, patch, protocol) of an addon.py's text, or None if it isn't one."""
     bl_info_at = source.find("bl_info = {")
-    if bl_info_at < 0 or '"name": "MCP for Blender"' not in source[bl_info_at:bl_info_at + 200]:
+    if bl_info_at < 0 or '"name": "mcp-for-blender-with-auth"' not in source[bl_info_at:bl_info_at + 200]:
         return None
     version = _ADDON_VERSION_RE.search(source, bl_info_at)
     protocol = _ADDON_PROTOCOL_RE.search(source)
-    if not version or not protocol:
+    auth_protocol = _ADDON_AUTH_PROTOCOL_RE.search(source)
+    if not version or not protocol or not auth_protocol:
+        return None
+    if int(auth_protocol.group(1)) != AUTH_PROTOCOL_VERSION:
         return None
     return (int(version.group(1)), int(version.group(2)), int(version.group(3) or 0), int(protocol.group(1)))
 

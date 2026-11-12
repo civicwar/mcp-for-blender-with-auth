@@ -9,3 +9,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ROOT_ADDON = REPO_ROOT / "addon.py"
+
+# Public test fixture, never a workstation credential.
+TEST_AUTH_TOKEN = "test-only-auth-secret-0123456789-abcdefghijk"
+
+
+def socket_command(command_type, params=None):
+    return {"type": command_type, "params": params or {}, "auth_token": TEST_AUTH_TOKEN}

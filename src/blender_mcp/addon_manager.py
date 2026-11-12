@@ -20,16 +20,15 @@ from pathlib import Path
 logger = logging.getLogger("BlenderMCPServer")
 
 # Must match ADDON_PROTOCOL_VERSION in addon.py / bundled/addon.py
-EXPECTED_ADDON_PROTOCOL_VERSION = 15
+EXPECTED_ADDON_PROTOCOL_VERSION = 16
 
-_ADDON_MARKER = 'bl_info = {\n    "name": "MCP for Blender"'
+_ADDON_MARKER = 'bl_info = {\n    "name": "mcp-for-blender-with-auth"'
 _INSTALLED_FILENAME = "blender_mcp.py"
 _PROTOCOL_RE = re.compile(r"ADDON_PROTOCOL_VERSION\s*=\s*(\d+)")
 _BL_INFO_VERSION_RE = re.compile(r'"version":\s*\((\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)')
-# Matches the current name and the pre-rename "Blender MCP" so install-addon
-# still replaces installs from older releases.
+# Recognize the fork and both upstream names when replacing older installs.
 _BL_INFO_NAME_RE = re.compile(
-    r"""["']name["']\s*:\s*["'](?:MCP for Blender|Blender MCP)["']"""
+    r"""["']name["']\s*:\s*["'](?:mcp-for-blender-with-auth|MCP for Blender|Blender MCP)["']"""
 )
 
 
@@ -74,8 +73,8 @@ class AddonStatusReport:
 
 
 _UPDATE_HINT = (
-    "Run `uvx mcp-for-blender install-addon` to update it, then in Blender: "
-    "Preferences → Add-ons → disable and re-enable 'Interface: MCP for Blender' "
+    "Run this fork's `mcp-for-blender install-addon` executable to update it, then in Blender: "
+    "Preferences → Add-ons → disable and re-enable 'Interface: mcp-for-blender-with-auth' "
     "(or restart Blender) and click Start MCP Server."
 )
 
@@ -114,7 +113,7 @@ def check_addon_status_on_startup() -> AddonStatusReport:
                 reason="not_installed",
                 message=(
                     "MCP for Blender addon not found in any Blender addons folder. "
-                    "Run `uvx mcp-for-blender install-addon` to install it."
+                    "Run this fork's `mcp-for-blender install-addon` executable to install it."
                 ),
             )
 
@@ -352,7 +351,7 @@ def install_addon(
     msg = (
         f"Installed MCP for Blender addon to {target}. "
         "In Blender: Preferences → Add-ons → disable then enable "
-        "'Interface: MCP for Blender', or restart Blender, then click Start MCP Server."
+        "'Interface: mcp-for-blender-with-auth', or restart Blender, then click Start MCP Server."
     )
     if len(replaced) > 1:
         msg += f" Also updated: {', '.join(replaced[:-1])}."
@@ -476,8 +475,8 @@ def handshake_addon(blender_connection) -> AddonHandshake:
             warning = (
                 f"Blender addon protocol {protocol_i!r} is behind "
                 f"expected {EXPECTED_ADDON_PROTOCOL_VERSION}. "
-                "Run `uvx mcp-for-blender install-addon` to update it, then "
-                "restart Blender or disable/enable 'Interface: MCP for Blender', "
+                "Run this fork's `mcp-for-blender install-addon` executable to update it, then "
+                "restart Blender or disable/enable 'Interface: mcp-for-blender-with-auth', "
                 "then Start MCP Server. Trajectory still works via fallbacks."
             )
         return AddonHandshake(
@@ -495,8 +494,8 @@ def handshake_addon(blender_connection) -> AddonHandshake:
         if "unknown command" in msg or "get_addon_info" in msg:
             warning = (
                 "Blender addon is outdated (no get_addon_info). "
-                "Run `uvx mcp-for-blender install-addon` to update it, then "
-                "restart Blender or disable/enable 'Interface: MCP for Blender', "
+                "Run this fork's `mcp-for-blender install-addon` executable to update it, then "
+                "restart Blender or disable/enable 'Interface: mcp-for-blender-with-auth', "
                 "then Start MCP Server. Fallbacks keep working in the meantime."
             )
             return AddonHandshake(

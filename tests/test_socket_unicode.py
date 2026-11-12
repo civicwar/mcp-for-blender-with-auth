@@ -23,6 +23,7 @@ import json
 
 import pytest
 from test_server_threading import BlenderMCPServer
+from conftest import TEST_AUTH_TOKEN, socket_command
 
 
 class _ScriptedSocket:
@@ -49,6 +50,7 @@ class _ScriptedSocket:
 
 def _make_server():
     server = BlenderMCPServer(port=0)
+    server._auth_token = TEST_AUTH_TOKEN
     server.execute_command = lambda command: {"status": "success", "result": {}}
     return server
 
@@ -67,7 +69,7 @@ def _split_after_lead_byte(payload: bytes) -> int:
 
 def test_split_multibyte_utf8_boundary_is_not_dropped():
     payload = json.dumps(
-        {"type": "ping", "params": {"note": "café ☕ 日本語"}}, ensure_ascii=False
+        socket_command("ping", {"note": "café ☕ 日本語"}), ensure_ascii=False
     ).encode("utf-8")
     split_idx = _split_after_lead_byte(payload)
     chunk1, chunk2 = payload[:split_idx], payload[split_idx:]
@@ -86,7 +88,7 @@ def test_split_multibyte_utf8_boundary_is_not_dropped():
         "recv() chunk boundary killed the connection instead of waiting for "
         "the rest of the buffer"
     )
-    command, _client = server.command_queue.get_nowait()
+    command, _client, _generation = server.command_queue.get_nowait()
     assert command["type"] == "ping"
     assert command["params"]["note"] == "café ☕ 日本語"
 
@@ -97,10 +99,10 @@ def test_split_multibyte_utf8_boundary_keeps_handler_loop_alive():
     If the split killed the loop, this second command would never be queued.
     """
     first = json.dumps(
-        {"type": "ping", "params": {"note": "emoji test 🎨"}}, ensure_ascii=False
+        socket_command("ping", {"note": "emoji test 🎨"}), ensure_ascii=False
     ).encode("utf-8")
     split_idx = _split_after_lead_byte(first)
-    second = json.dumps({"type": "ping", "params": {}}).encode("utf-8")
+    second = json.dumps(socket_command("ping")).encode("utf-8")
 
     server = _make_server()
     server.running = True
@@ -110,7 +112,7 @@ def test_split_multibyte_utf8_boundary_keeps_handler_loop_alive():
 
     queued = []
     while not server.command_queue.empty():
-        command, _client = server.command_queue.get_nowait()
+        command, _client, _generation = server.command_queue.get_nowait()
         queued.append(command)
 
     assert len(queued) == 2, f"expected both commands queued, got {queued}"

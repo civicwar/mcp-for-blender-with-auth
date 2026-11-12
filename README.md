@@ -3,7 +3,7 @@
 <img src="assets/logo-banner.svg" alt="MCP for Blender — Connect Blender to any LLM" width="480" />
 
 *formerly `blender-mcp` — the PyPI package is now [`mcp-for-blender`](https://pypi.org/project/mcp-for-blender/).*
-*Existing setups keep working; no config change is required. [Read more](https://github.com/ahujasid/mcp-for-blender/issues/366)*
+**mcp-for-blender-with-auth** requires authenticated connections. [Setup and migration](docs/authentication.md).
 
 **Disclaimer:** This is a third-party integration and not made by Blender
 
@@ -32,6 +32,14 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 ---
 
 ## Quickstart
+
+**For this authenticated fork, follow [local setup and migration](docs/authentication.md).**
+Both the bridge and add-on must come from this checkout and share a random secret.
+The public PyPI package and website installers below install the upstream release,
+not this fork. Existing unauthenticated clients are deliberately rejected.
+
+<details>
+<summary>Upstream installation reference (does not install this fork)</summary>
 
 > **Note:** the PyPI package `blender-mcp` is now **`mcp-for-blender`**. Existing setups
 > keep working — `uvx blender-mcp` still runs the server and **no config change is
@@ -145,6 +153,8 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 
 > **Note:** Only run **one** instance of the MCP server (either Cursor or Claude Desktop), not both.
 
+</details>
+
 ---
 
 ## Table of Contents
@@ -212,6 +222,9 @@ The system consists of two main components:
 ---
 
 ## Installation
+
+These upstream distribution recipes do not install this fork. Use the
+[authenticated fork setup](docs/authentication.md) for a local installation.
 
 ### Automatic setup
 
@@ -369,6 +382,7 @@ The following environment variables can be used to configure the Blender connect
 |---|---|---|
 | `BLENDER_HOST` | `localhost` | Host address for Blender socket server |
 | `BLENDER_PORT` | `9876` | Port number for Blender socket server |
+| `BLENDER_MCP_AUTH_TOKEN` | none (required) | Random shared secret, 32-256 printable ASCII characters without spaces. Set for the bridge; set the same value in Blender's environment or Auth Token preference. |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
 | `BLENDER_MCP_APPS` | auto | Set to `1` to force the inline viewport app on for clients that support MCP Apps without advertising it (the Codex plugin sets this) |
 | `BLENDER_MCP_OPENAI_FORMS` | auto | Set to `1` to force the thumbnail asset pickers on (the Codex plugin sets this) |
@@ -402,10 +416,9 @@ In an MCP client config that means a second entry differing only in `args`:
 
 Each instance needs its own port set in the Blender addon panel to match.
 
-> **Note:** the addon's socket server has no authentication or encryption, so
-> anyone who can reach that port can run Python inside Blender. Keep it on
-> `localhost` unless you are on a trusted network, and prefer an SSH tunnel over
-> pointing `--host`/`BLENDER_HOST` at a remote machine directly.
+> This fork requires the shared secret on every request. Traffic, including the
+> secret, is not encrypted. Keep the listener on localhost and use an encrypted
+> tunnel for remote access. See the [security boundary](docs/authentication.md#security-boundary).
 
 #### Safe mode
 
@@ -829,8 +842,11 @@ requires your own fal.ai API key. The trial key button is hidden in fal.ai mode.
 
 The system uses a simple JSON-based protocol over TCP sockets:
 
-- **Commands** are sent as JSON objects with a `type` and optional `params`
+- **Commands** are sent as JSON objects with a `type`, optional `params`, and required `auth_token`
 - **Responses** are JSON objects with a `status` and `result` or `message`
+- The bridge first sends an `authenticate` request and requires authentication protocol 1.
+  Missing/wrong credentials are rejected before commands enter Blender's queue;
+  legacy add-ons are not used. See the [wire protocol](docs/authentication.md#wire-protocol).
 
 ### Connecting from another machine
 
@@ -841,9 +857,9 @@ interfaces), enable **Allow Remote Connections**, then disconnect and reconnect.
 the client side, set `BLENDER_HOST` to that address and `BLENDER_PORT` to the port
 shown in Blender.
 
-**Remote access has no authentication or encryption and lets clients run Python in
-Blender.** Use it only on a trusted network behind a firewall, never on the public
-internet. An SSH tunnel to the default `localhost` listener is a safer alternative.
+**Authentication does not encrypt the secret or Blender traffic.** Keep the listener
+on localhost and use an encrypted tunnel for remote connections; do not expose the
+raw port on the LAN or internet. A client with the secret can execute Python in Blender.
 
 ## Limitations & Security Considerations
 
@@ -854,18 +870,18 @@ internet. An SSH tunnel to the default `localhost` listener is a safer alternati
 
 ## Telemetry Control
 
-Telemetry is **opt-in**. Collection of your content is off by default and stays off until you explicitly turn it on.
+In this fork, **all telemetry is opt-in and off by default**. When **Allow Telemetry** is unchecked in Blender's add-on preferences, no telemetry is uploaded, including basic usage counts, startup events, install/session IDs, prompts, code, errors, screenshots, scene data, trajectory steps, or feedback.
 
-**What is collected by default (no opt-in):** a minimal anonymous usage record so I can count active users and see which tools get used — a randomly generated install ID, a session ID, the tool name, whether it succeeded, how long it took, the MCP for Blender and Blender versions, your operating system, and a timestamp.
+**To opt in** — go to **Edit → Preferences → Add-ons → MCP for Blender** and check **Allow Telemetry**. Some MCP clients also offer a one-time consent dialog. Opting in permits usage records (including a persistent install ID, session ID, tool names, success, duration, versions, operating system and timestamps), prompts, generated code, screenshots, and trajectory data; see the terms below. A configured telemetry backend is also required; a clean checkout of this fork has none and leaves telemetry disabled.
 
-**Never collected without opting in:** your prompts, generated code, viewport screenshots, scene data, and trajectory steps.
+**To turn it off** — uncheck **Allow Telemetry**, or ask the agent to use `disable_telemetry`. Consent is read live rather than cached for 30 seconds. Background events, screenshots, trajectory steps and feedback recheck consent before uploading; queued records processed while off are discarded rather than saved for a later opt-in. If Blender cannot be reached or consent is missing/invalid, no telemetry is sent. Disabling consent also discards the add-on's buffered manual-edit records and resets its operator baseline.
 
-**To opt in** — go to **Edit → Preferences → Add-ons → MCP for Blender** and check the telemetry consent checkbox. Some MCP clients will also offer you a one-time opt-in prompt at the start of a conversation. Opting in adds prompts, generated code, screenshots, and trajectory data to what's collected; see the TnC for details. You can turn it back off in the same place at any time.
+An HTTP upload already authorized and in progress when you change the preference cannot be recalled. Disabling telemetry does not delete data previously uploaded. It does not disable separate update checks or asset/generation services you request.
 
-**To turn off telemetry entirely**, including the minimal anonymous usage record, set an environment variable:
+**To enforce off regardless of the checkbox**, set `DISABLE_TELEMETRY`, `BLENDER_MCP_DISABLE_TELEMETRY`, or `MCP_DISABLE_TELEMETRY` to `true`, `1`, `yes`, or `on` in the MCP server's environment. For example, with this fork's installed executable:
 
 ```bash
-DISABLE_TELEMETRY=true uvx mcp-for-blender
+DISABLE_TELEMETRY=true mcp-for-blender
 ```
 
 Or add it to your MCP config:
@@ -874,8 +890,7 @@ Or add it to your MCP config:
 {
     "mcpServers": {
         "blender": {
-            "command": "uvx",
-            "args": ["mcp-for-blender"],
+            "command": "/absolute/path/to/this-fork/.venv/bin/mcp-for-blender",
             "env": {
                 "DISABLE_TELEMETRY": "true"
             }
@@ -884,7 +899,9 @@ Or add it to your MCP config:
 }
 ```
 
-Telemetry data is not linked to your name or account. It may be used to improve MCP for Blender, for research, and to train AI models.
+Use the Windows `.venv/Scripts/mcp-for-blender.exe` path on Windows, and preserve your existing authentication environment/configuration as described in [authentication setup](docs/authentication.md). The path above is a placeholder for your local checkout.
+
+Opted-in telemetry may be used to improve MCP for Blender, for research, and to train AI models. Prompts, screenshots and scene content may contain identifying information even though usage records do not include a name or account field.
 
 Full detail on what is collected, and the license you grant by opting in, is in [TERMS_AND_CONDITIONS.md](TERMS_AND_CONDITIONS.md).
 

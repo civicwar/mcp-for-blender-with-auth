@@ -42,11 +42,19 @@ def test_release_key_reads_version_and_protocol(addon):
 
 @pytest.mark.parametrize("text", [
     "print('hello')",
-    SOURCE.replace('"name": "MCP for Blender"', '"name": "Something Else"', 1),
+    SOURCE.replace('"name": "mcp-for-blender-with-auth"', '"name": "Something Else"', 1),
     SOURCE.replace("ADDON_PROTOCOL_VERSION = ", "PROTOCOL = ", 1),
-], ids=["not-the-addon", "renamed-addon", "no-protocol"])
+    SOURCE.replace("AUTH_PROTOCOL_VERSION = 1", "AUTH_PROTOCOL_VERSION = 0", 1),
+    SOURCE.replace("AUTH_PROTOCOL_VERSION = 1", "REMOVED_AUTH_PROTOCOL = 1", 1),
+], ids=["not-the-addon", "renamed-addon", "no-protocol", "incompatible-auth", "no-auth"])
 def test_release_key_rejects_files_that_are_not_the_addon(addon, text):
     assert addon.addon_release_key(text) is None
+
+
+def test_updates_use_the_authenticated_fork(addon):
+    assert addon.ADDON_UPDATE_URL == (
+        "https://raw.githubusercontent.com/civicwar/mcp-for-blender-with-auth/main/addon.py"
+    )
 
 
 def test_newer_main_is_offered(monkeypatch, addon):
@@ -109,8 +117,9 @@ def test_install_replaces_the_file_and_keeps_a_backup(tmp_path, addon):
 
 @pytest.mark.parametrize(
     "bad",
-    ["print('not the addon')", _with_version((99, 0), 99) + "\ndef broken(:\n"],
-    ids=["not-the-addon", "syntax-error"],
+    ["print('not the addon')", _with_version((99, 0), 99) + "\ndef broken(:\n",
+     _with_version((99, 0), 99).replace("AUTH_PROTOCOL_VERSION = 1", "REMOVED_AUTH_PROTOCOL = 1", 1)],
+    ids=["not-the-addon", "syntax-error", "no-auth"],
 )
 def test_install_refuses_anything_but_a_valid_addon(tmp_path, addon, bad):
     target = tmp_path / "addon.py"

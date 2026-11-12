@@ -1,6 +1,6 @@
 """
-Privacy-focused, anonymous telemetry for Blender MCP
-Tracks tool usage, DAU/MAU, and performance metrics
+Opt-in telemetry for Blender MCP.
+All collection and uploads require current, explicit Blender UI consent.
 """
 
 import contextlib
@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -36,9 +37,6 @@ def get_package_version() -> str:
 
 
 MCP_VERSION = get_package_version()
-
-CONSENT_CACHE_TTL = 30.0
-
 
 class EventType(str, Enum):
     """Types of telemetry events"""
@@ -77,7 +75,16 @@ class TelemetryCollector:
     def __init__(self):
         """Initialize telemetry collector"""
         # Import config here to avoid circular imports
-        from .config import telemetry_config
+        try:
+            from .config import telemetry_config
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{__package__}.config":
+                raise
+            # The upstream telemetry backend config is gitignored. A clean
+            # checkout must still work without copying deployment credentials.
+            # No backend fields are used while collection is disabled.
+            telemetry_config = SimpleNamespace(enabled=False)
+            logger.info("Telemetry disabled: no backend configuration installed")
         self.config = telemetry_config
 
         # Check if disabled via environment variables
@@ -93,12 +100,7 @@ class TelemetryCollector:
         self._event_timestamps: list[float] = []
         self._rate_limit_lock = threading.Lock()
 
-        self._consent_cache: bool | None = None
-        self._consent_cached_at: float = 0.0
-        self._consent_lock = threading.Lock()
-
-        # Reported by the addon at handshake. Kept with or without consent: the
-        # consent default lives in the addon, so these say which default applied.
+        # Reported locally by the addon at handshake; uploaded only with consent.
         self.addon_version: str | None = None
         self.addon_protocol: int | None = None
 
@@ -165,34 +167,34 @@ class TelemetryCollector:
         """Whether collection is permitted. Unreachable Blender means no."""
         return self.check_user_consent() is True
 
+    def is_enabled(self) -> bool:
+        """Require both backend permission and live UI consent, for every path."""
+        return bool(
+            self.config.enabled
+            and not self._is_disabled()
+            and self._check_user_consent()
+        )
+
     def check_user_consent(self) -> bool | None:
         """Consent from Blender: True, False, or None if unreachable.
 
-        Cached for CONSENT_CACHE_TTL seconds. A mutating tool call would
-        otherwise trigger several consent round-trips (telemetry event, plus a
-        before/after trajectory snapshot each), all serialized on the single
-        Blender socket.
+        Never cache an affirmative answer: the checkbox can change between
+        recording an event and the background worker sending it.
         """
-        with self._consent_lock:
-            if (
-                self._consent_cache is not None
-                and (time.time() - self._consent_cached_at) < CONSENT_CACHE_TTL
-            ):
-                return self._consent_cache
-
         try:
             from .server import get_blender_connection
             blender = get_blender_connection()
             result = blender.send_command("get_telemetry_consent")
-            consent = bool(result.get("consent", False))
+            # Strings such as "false", missing fields and error replies are
+            # not consent. Only Blender's literal boolean True grants it.
+            return (
+                isinstance(result, dict)
+                and "error" not in result
+                and result.get("consent") is True
+            )
         except Exception as e:
             logger.debug(f"Could not check telemetry consent: {e}")
             return None
-
-        with self._consent_lock:
-            self._consent_cache = consent
-            self._consent_cached_at = time.time()
-        return consent
 
     def set_addon_info(self, addon_version: list[int] | None, protocol: int | None) -> None:
         """Tag later events with the connected addon's version and protocol."""
@@ -200,12 +202,6 @@ class TelemetryCollector:
             ".".join(str(part) for part in addon_version) if addon_version else None
         )
         self.addon_protocol = protocol
-
-    def invalidate_consent_cache(self) -> None:
-        """Force the next consent check to re-query Blender."""
-        with self._consent_lock:
-            self._consent_cache = None
-            self._consent_cached_at = 0.0
 
     def record_event(
         self,
@@ -218,32 +214,15 @@ class TelemetryCollector:
         blender_version: str | None = None,
         metadata: dict[str, Any] | None = None
     ):
-        """Record a telemetry event (non-blocking)"""
-        if not self.config.enabled:
+        """Queue an event only with explicit consent; upload is checked again."""
+        if not self.is_enabled():
             return
 
-        # Check user consent for private data collection
-        user_consent = self._check_user_consent()
-        
-        if not user_consent:
-            # Without consent, only collect minimal anonymous usage data:
-            # - Session startup events
-            # - Tool execution events (tool name, success, duration)
-            # - Basic session info for DAU/MAU calculation
-            # Remove all private information:
-            prompt_text = None  # No user prompts
-            metadata = None  # No code snippets, params, screenshots, scene info
-            # Keep error_message for debugging, but sanitize it
-            if error_message:
-                # Only keep generic error type, not specific details
-                error_message = "Error occurred (details withheld without consent)"
-
-        # Truncate prompt if needed (only if consent was given)
+        # Truncate prompt if needed.
         if prompt_text and len(prompt_text) > self.config.max_prompt_length:
             prompt_text = prompt_text[:self.config.max_prompt_length] + "..."
 
-        # Truncate error messages (only if consent was given and not already sanitized)
-        if error_message and user_consent and len(error_message) > 200:
+        if error_message and len(error_message) > 200:
             error_message = error_message[:200] + "..."
 
         event = TelemetryEvent(
@@ -310,6 +289,10 @@ class TelemetryCollector:
                 "event_timestamp": int(event.timestamp),
             }
 
+            # An event may have been queued before the user opted out. Drop
+            # it instead of sending it or retaining it for a later opt-in.
+            if not self.is_enabled():
+                return
             response = httpx.post(
                 f"{self.config.supabase_url}/rest/v1/telemetry_events",
                 json=data,
@@ -332,12 +315,7 @@ class TelemetryCollector:
         Returns:
             Storage path reference (storage:bucket/filename) or empty string on failure
         """
-        if not self.config.enabled:
-            return ""
-
-        # Only upload screenshots with user consent
-        if not self._check_user_consent():
-            logger.debug("User has not consented to telemetry, skipping screenshot upload")
+        if not self.is_enabled():
             return ""
 
         try:
@@ -396,8 +374,8 @@ def record_startup(blender_version: str | None = None):
 
 
 def is_telemetry_enabled() -> bool:
-    """Check if telemetry is enabled"""
+    """Check effective permission, including live consent and environment."""
     try:
-        return get_telemetry().config.enabled
+        return get_telemetry().is_enabled()
     except Exception:
         return False

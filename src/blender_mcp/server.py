@@ -29,6 +29,7 @@ from .consent_prompt import maybe_prompt_for_consent
 from .premium_hint import premium_hint_once, premium_generation_guidance
 from . import blender_scripts, context_log, generation
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
+from .auth import AuthenticationError, AUTH_PROTOCOL_VERSION, load_auth_token
 from .openai_apps import (
     APP_MIME_TYPE,
     VIEWPORT_STATE_META,
@@ -112,25 +113,67 @@ class BlenderConnection:
     # Serializes send+receive so two commands can never interleave on one socket.
     # Without this, a second command's response can be read as the first's, and
     # the stream stays desynced until the 180s timeout fires.
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Reentrant because a send may reconnect/authenticate while holding the lock.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _auth_token: str = field(default="", init=False, repr=False)
 
     def connect(self) -> bool:
-        """Connect to the Blender addon socket server"""
-        if self.sock:
+        """Connect and require proof of authentication support before any tool call."""
+        with self._lock:
+            return self._connect_locked()
+
+    def _connect_locked(self) -> bool:
+        if self.sock and self._auth_token:
             return True
-            
+
+        self.disconnect()
+        token = load_auth_token()  # Fail closed before opening a socket.
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
+            # A legacy add-on ignores extra JSON fields. A separate probe stops
+            # us from silently using such a listener for privileged commands.
+            self.sock.sendall(json.dumps({
+                "type": "authenticate", "auth_token": token,
+            }).encode("utf-8"))
+            response = json.loads(self.receive_full_response(
+                self.sock, timeout=5.0, max_bytes=8192,
+            ).decode("utf-8"))
+            result = response.get("result") if isinstance(response, dict) else None
+            if (
+                not isinstance(response, dict)
+                or response.get("status") != "success"
+                or not isinstance(result, dict)
+                or result.get("authenticated") is not True
+                or type(result.get("auth_protocol")) is not int
+                or result["auth_protocol"] != AUTH_PROTOCOL_VERSION
+            ):
+                raise AuthenticationError(
+                    "Blender authentication failed. Configure the same secret on both "
+                    "sides and install the matching authenticated add-on; anonymous "
+                    "and legacy listeners are not supported."
+                )
+            self._auth_token = token
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
+        except AuthenticationError:
+            self.disconnect()
+            raise
         except Exception as e:
-            logger.error(f"Failed to connect to Blender: {str(e)}")
-            self.sock = None
+            # Do not log a peer's response: an untrusted listener could echo
+            # the credential. Only the exception type is useful here.
+            logger.error(f"Failed to authenticate connection to Blender ({type(e).__name__})")
+            self.disconnect()
             return False
     
     def disconnect(self):
         """Disconnect from the Blender addon"""
+        with self._lock:
+            self._disconnect_locked()
+
+    def _disconnect_locked(self):
+        self._auth_token = ""
         if self.sock:
             try:
                 self.sock.close()
@@ -139,15 +182,23 @@ class BlenderConnection:
             finally:
                 self.sock = None
 
-    def receive_full_response(self, sock, buffer_size=8192):
+    def receive_full_response(self, sock, buffer_size=8192, timeout=180.0, max_bytes=None):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
         # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        sock.settimeout(timeout)
+        received_bytes = 0
+        # Authentication has an overall deadline, not just a timeout per chunk.
+        deadline = time.monotonic() + timeout if max_bytes is not None else None
         
         try:
             while True:
                 try:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise socket.timeout()
+                        sock.settimeout(remaining)
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         # If we get an empty chunk, the connection might be closed
@@ -156,6 +207,9 @@ class BlenderConnection:
                         break
                     
                     chunks.append(chunk)
+                    received_bytes += len(chunk)
+                    if max_bytes is not None and received_bytes > max_bytes:
+                        raise ConnectionError("Authentication response exceeds size limit")
                     
                     # Check if we've received a complete JSON object
                     try:
@@ -164,7 +218,7 @@ class BlenderConnection:
                         # If we get here, it parsed successfully
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         # Incomplete JSON, continue receiving
                         continue
                 except socket.timeout:
@@ -189,7 +243,7 @@ class BlenderConnection:
                 # Try to parse what we have
                 json.loads(data.decode('utf-8'))
                 return data
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 # If we can't parse it, it's incomplete
                 raise Exception("Incomplete JSON response received")
         else:
@@ -213,12 +267,13 @@ class BlenderConnection:
                 viewport_store.command_finished("observe" if read_only else command_type)
 
     def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        if not self.sock and not self.connect():
+        if (not self.sock or not self._auth_token) and not self.connect():
             raise ConnectionError("Not connected to Blender")
 
         command = {
             "type": command_type,
-            "params": params or {}
+            "params": params or {},
+            "auth_token": self._auth_token,
         }
 
         try:
@@ -240,30 +295,33 @@ class BlenderConnection:
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
             
             if response.get("status") == "error":
+                if response.get("code") == "AUTHENTICATION_FAILED":
+                    raise AuthenticationError("Blender rejected the connection credentials")
                 logger.error(f"Blender error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Blender"))
             
             return response.get("result", {})
+        except AuthenticationError:
+            self.disconnect()
+            raise
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
             # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
+            self.disconnect()
             raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
+            self.disconnect()
             raise Exception(f"Invalid response from Blender: {str(e)}")
         except Exception as e:
             logger.error(f"Error communicating with Blender: {str(e)}")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Communication error with Blender: {str(e)}")
 
 @asynccontextmanager
@@ -459,7 +517,7 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     user's own API keys. When pointing the user to Premium, link
     https://mcp-for-blender.com/premium?ref=mcp-status
 
-    If outdated, tells the user how to update via `uvx mcp-for-blender install-addon`
+    If outdated, tells the user to run this fork's `mcp-for-blender install-addon` executable
     (then restart or re-enable the addon in Blender).
 
     `telemetry_consent` reports whether data collection is on, off, or null if
@@ -486,10 +544,11 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "source": result.source,
             "warning": result.warning,
             "telemetry_consent": get_telemetry().check_user_consent(),
-            "update_command": "uvx mcp-for-blender install-addon",
+            "update_command": "mcp-for-blender install-addon",
+            "update_command_scope": "Use this fork's installed executable; do not install the public PyPI release",
             "after_install": (
                 "If the addon file was updated: in Blender, Preferences → Add-ons → "
-                "disable/enable 'Interface: Blender MCP', or restart Blender, then Start MCP Server."
+                "disable/enable 'Interface: mcp-for-blender-with-auth', or restart Blender, then Start MCP Server."
             ),
         }
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
@@ -501,26 +560,25 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
 @mcp.tool()
 def disable_telemetry(ctx: Context, user_prompt: str = "") -> str:
     """
-    Turn OFF collection of prompts, code, screenshots and scene data.
+    Turn OFF all telemetry, including basic usage counts.
 
     Use this whenever the user asks to stop data collection, opt out of
     telemetry, or stop sharing their data. Takes effect immediately.
 
     This tool can only turn collection OFF. Turning it back on is done by the
-    user in Blender under Preferences > Add-ons > Blender MCP.
+    user in Blender under Preferences > Add-ons > mcp-for-blender-with-auth.
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("set_telemetry_consent", {"consent": False})
         if "error" in result:
             return f"Could not turn off data collection: {result['error']}"
-        get_telemetry().invalidate_consent_cache()
         return (
-            "Data collection is now OFF. Prompts, code, screenshots and scene "
-            "data are no longer collected. Minimal anonymous usage counts "
-            "(tool name, success, duration) still apply -- see the terms for "
-            "details. To turn collection back on, tick 'Allow Telemetry' in "
-            "Blender under Preferences > Add-ons > Blender MCP."
+            "All telemetry is now OFF, including usage counts, prompts, code, "
+            "screenshots and scene data. Pending uploads are checked again "
+            "and discarded while telemetry is off. An HTTP upload already "
+            "in progress cannot be recalled. To turn collection back on, tick 'Allow Telemetry' in "
+            "Blender under Preferences > Add-ons > mcp-for-blender-with-auth."
         )
     except Exception as e:
         return f"Error turning off data collection: {e}"
@@ -538,7 +596,7 @@ def disable_telemetry(ctx: Context, user_prompt: str = "") -> str:
 #   (look -> the native screenshot, get_scene_info -> the addon's own summary).
 # tests/test_compat_matrix.py runs the tools against real past addons.
 
-ADDON_UPDATE_HINT = "Update the Blender addon: run `uvx mcp-for-blender install-addon`, then restart Blender."
+ADDON_UPDATE_HINT = "Update the Blender addon with this fork's `mcp-for-blender install-addon` executable, then restart Blender."
 
 
 class AddonTooOld(Exception):
@@ -2280,7 +2338,7 @@ def main():
             "It will now wait silently for a client on stdin -- that is normal, "
             "not a hang. Press Ctrl-C to exit. "
             "Setup guide: https://github.com/ahujasid/blender-mcp#installation "
-            "(if the addon is outdated this logs how to update it: uvx mcp-for-blender install-addon)"
+            "(if the addon is outdated, use this fork's mcp-for-blender install-addon executable)"
         )
     context_log.install(mcp, SERVER_INSTRUCTIONS)
     mcp.run()

@@ -2,6 +2,8 @@
 
 **Last Updated: August 2026**
 
+**Fork telemetry behavior updated: November 12, 2026.** This fork requires explicit consent for all telemetry, including basic usage records. The off behavior below replaces the upstream minimum-usage collection policy.
+
 ---
 
 ## 1. About This Project
@@ -14,7 +16,7 @@ By using Blender MCP, you agree to these terms. If you do not agree, please do n
 
 ## 2. Data I Collect
 
-Collection of your content is **opt-in**. Unless you explicitly turn on telemetry consent in the Blender MCP addon preferences, the only thing collected is the minimal anonymous usage record described at the end of this section.
+All telemetry is **opt-in**, including basic usage records. Unless you explicitly turn on **Allow Telemetry** in the Blender MCP addon preferences, no telemetry is uploaded. A configured backend is also required; a clean checkout of this fork has no backend configuration and disables telemetry.
 
 When you have opted in, I may collect:
 
@@ -37,7 +39,7 @@ I do **not** collect:
 
 Trajectory, screenshot, and manual-edit collection only occurs while telemetry consent is enabled in the Blender MCP addon preferences — it is **disabled by default**, so this requires you to turn it on, and you can turn it back off there at any time — **and** the MCP server is running. Turning off consent or stopping the server removes the handlers that observe your manual edits.
 
-Unless you opt in, a minimal anonymous usage record is all that is sent, so I can count active users and see which tools get used: a randomly generated install ID, a session ID, the tool name, whether it succeeded, how long it took, the Blender MCP and Blender versions, your operating system, and a timestamp. No prompts, code, screenshots, scene data, or manual-edit records are included. To stop this record too, set `DISABLE_TELEMETRY=true` in the environment of the MCP server, which disables all telemetry.
+Usage records are sent only with consent and may include a persistent randomly generated install ID, session ID, tool name, success, duration, Blender MCP and Blender versions, operating system, and timestamp. Turning off consent also stops these records. Consent is read live before every upload, including queued events, trajectory steps and feedback; an unavailable or invalid consent response prevents uploading. Queued records processed while off are discarded. An HTTP upload already authorized and in progress cannot be recalled, and withdrawing consent does not delete previously uploaded data. Separate update checks and user-requested asset/generation services are unaffected.
 
 ---
 
@@ -76,9 +78,9 @@ You may:
 
 - **Request access** to the data I've collected from your usage
 - **Request deletion** of your data
-- **Decline to opt in**, which is the default state — leave the telemetry option in the Blender MCP addon preferences unchecked, and none of your prompts, code, screenshots, scene data, or trajectory data is collected. You can use the software normally either way.
-- **Withdraw consent** at any time by unchecking that option again. Collection stops immediately.
-- **Turn off telemetry entirely**, including the minimal anonymous usage record, by setting `DISABLE_TELEMETRY=true` in the MCP server's environment.
+- **Decline to opt in**, which is the default state — leave **Allow Telemetry** unchecked to prevent all telemetry uploads, including usage records. You can use the software normally either way.
+- **Withdraw consent** at any time by unchecking that option again or using `disable_telemetry`. Pending uploads recheck consent and are discarded while off; already in-progress requests cannot be recalled.
+- **Enforce off regardless of the checkbox** by setting `DISABLE_TELEMETRY=true`, `BLENDER_MCP_DISABLE_TELEMETRY=true`, or `MCP_DISABLE_TELEMETRY=true` in the MCP server's environment.
 
 To exercise these rights, contact me at ahujasid@gmail.com.
 

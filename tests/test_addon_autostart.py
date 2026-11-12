@@ -13,7 +13,7 @@ import types
 from typing import ClassVar
 
 import pytest
-from conftest import ROOT_ADDON
+from conftest import ROOT_ADDON, TEST_AUTH_TOKEN
 
 _AUTOSTART_FUNCTIONS = {
     "_blendermcp_bind_address",
@@ -93,6 +93,7 @@ def _load_autostart_helpers():
         "persistent": lambda fn: fn,
         "BlenderMCPServer": _Server,
         "get_blendermcp_addon_preferences": lambda context=None: None,
+        "_blendermcp_auth_token": lambda context=None: TEST_AUTH_TOKEN,
         "_user_stopped_server": False,
     }
     exec(  # noqa: S102 - execute only the selected functions from our own source.
@@ -269,6 +270,21 @@ def test_auto_start_does_not_bind_when_configuration_is_rejected(host):
     assert namespace["_blendermcp_ensure_server_running"]() is None
     assert _Server.instances == []
     assert scene.blendermcp_server_running is False
+
+
+def test_missing_auth_secret_prevents_auto_and_manual_start():
+    namespace, bpy, _timers, scene = _load_autostart_helpers()
+
+    def no_secret(context=None):
+        raise ValueError("Authentication is required")
+
+    namespace["_blendermcp_auth_token"] = no_secret
+    assert namespace["_blendermcp_ensure_server_running"]() is None
+    assert _Server.instances == []
+    result, reports = _manual_connect(namespace, bpy.context)
+    assert result == {"CANCELLED"}
+    assert reports == [({"ERROR"}, "Authentication is required")]
+    assert not scene.blendermcp_server_running
 
 
 def test_stopped_server_uses_updated_bind_preferences():

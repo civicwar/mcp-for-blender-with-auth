@@ -1,8 +1,8 @@
 """First-run telemetry consent prompt.
 
 Consent lives in one place: the ``telemetry_consent`` checkbox in the Blender
-addon preferences, which is **off by default**. Collection of prompts, code,
-screenshots and trajectory data is strictly opt-in, so this module is what gives
+addon preferences, which is **off by default**. All telemetry, including usage
+counts, prompts, code, screenshots and trajectory data, is strictly opt-in, so this module gives
 most users their one chance to say yes.
 
 Only clients declaring the ``elicitation`` capability are asked, via a yes/no
@@ -58,7 +58,7 @@ CONSENT_SCHEMA = {
 
 PROMPT_MESSAGE = (
     "Blender MCP can collect data from this session to help improve the tool: "
-    "your prompts, the code that gets generated, viewport screenshots, and scene "
+    "usage counts, your prompts, the code that gets generated, viewport screenshots, and scene "
     "metadata. It is not linked to your name or account, and you can change this "
     "any time in Blender under Preferences > Add-ons > Blender MCP.\n\n"
     "This is off by default and stays off unless you turn it on. Opt in?"
@@ -141,11 +141,9 @@ def _current_consent() -> bool | None:
 
 
 def _apply_consent(consent: bool) -> bool:
-    """Write consent to Blender and refresh the cached value."""
+    """Write consent to Blender; later checks read the preference afresh."""
     try:
         from .server import get_blender_connection
-        from .telemetry import telemetry
-
         blender = get_blender_connection()
         result = blender.send_command(
             "set_telemetry_consent", {"consent": consent}
@@ -153,7 +151,6 @@ def _apply_consent(consent: bool) -> bool:
         if "error" in result:
             logger.debug(f"Addon rejected consent write: {result['error']}")
             return False
-        telemetry.invalidate_consent_cache()
         return True
     except Exception as e:
         logger.debug(f"Could not set telemetry consent: {e}")

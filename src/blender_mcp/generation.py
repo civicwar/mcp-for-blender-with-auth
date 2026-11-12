@@ -63,13 +63,13 @@ PENDING_MAX_AGE_S = 2 * 3600
 TRIPO_UNAVAILABLE = ("Tripo is not enabled. In the MCP for Blender sidebar in Blender (press N in the 3D Viewport), "
                      "tick Tripo under AI Model Generation and paste a Tripo API key, or use MCP for Blender Premium: "
                      f"{PREMIUM_URL}?ref=mcp-tripo. If Premium is on, update the Blender addon: run "
-                     "`uvx mcp-for-blender install-addon`, then restart Blender.")
+                     "this fork's `mcp-for-blender install-addon` executable, then restart Blender.")
 MESHY_UNAVAILABLE = ("Meshy is not enabled. In the MCP for Blender sidebar in Blender (press N in the 3D Viewport), "
                      "tick Meshy under AI Model Generation and paste a Meshy API key (needs a paid Meshy plan).")
 MESHY_PREMIUM_NEEDS_UPDATE = ("Meshy through MCP for Blender Premium needs the latest Blender addon: run "
-                              "`uvx mcp-for-blender install-addon`, then restart Blender and tick Meshy in the "
+                              "this fork's `mcp-for-blender install-addon` executable, then restart Blender and tick Meshy in the "
                               "MCP for Blender sidebar.")
-MESHY_POSE_NEEDS_UPDATE = ("pose_mode needs the latest Blender addon: run `uvx mcp-for-blender install-addon`, "
+MESHY_POSE_NEEDS_UPDATE = ("pose_mode needs the latest Blender addon: run this fork's `mcp-for-blender install-addon` executable, "
                            "then restart Blender.")
 MESHY_POSE_NOT_IN_PREMIUM = ("pose_mode isn't available through MCP for Blender Premium yet, only on your own Meshy "
                              "API key. Generate without pose_mode, or switch Generation Source to Your own API keys "

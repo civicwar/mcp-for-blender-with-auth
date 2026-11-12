@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import json
+import hmac
 import socket
 import sys
 import threading
@@ -21,7 +22,7 @@ import time
 import types
 from contextlib import contextmanager
 
-from conftest import ROOT_ADDON
+from conftest import ROOT_ADDON, TEST_AUTH_TOKEN, socket_command
 
 
 class _NullEditRecorder:
@@ -75,11 +76,14 @@ def _load_server_class():
         "socket": socket,
         "threading": threading,
         "json": json,
+        "hmac": hmac,
         "time": time,
         "queue": __import__("queue"),
         "traceback": __import__("traceback"),
         "os": __import__("os"),
         "get_blendermcp_addon_preferences": lambda context=None: None,
+        "_blendermcp_auth_token": lambda context=None: TEST_AUTH_TOKEN,
+        "AUTH_PROTOCOL_VERSION": 1,
         "RODIN_FREE_TRIAL_KEY": "vibecoding",
         # start()/stop() drive the edit-capture handlers, which live at module
         # scope in addon.py and so are not carried in by lifting the class.
@@ -128,7 +132,7 @@ def test_client_thread_never_registers_a_timer():
     server.start()
     try:
         with socket.create_connection(("localhost", server.port), timeout=5) as client:
-            client.sendall(json.dumps({"type": "ping"}).encode())
+            client.sendall(json.dumps(socket_command("ping")).encode())
 
             pump = threading.Thread(target=_pump, args=(server,), daemon=True)
             pump.start()
@@ -148,7 +152,7 @@ def test_command_is_queued_not_executed_on_client_thread():
     server.start()
     try:
         with socket.create_connection(("localhost", server.port), timeout=5) as client:
-            client.sendall(json.dumps({"type": "ping"}).encode())
+            client.sendall(json.dumps(socket_command("ping")).encode())
 
             # No pump running, so nothing should execute yet.
             deadline = time.time() + 2.0
@@ -231,7 +235,7 @@ def test_restart_rebinds_port_cleanly():
     second.start()
     try:
         with socket.create_connection(("localhost", port), timeout=5) as client:
-            client.sendall(json.dumps({"type": "ping"}).encode())
+            client.sendall(json.dumps(socket_command("ping")).encode())
             pump = threading.Thread(target=_pump, args=(second,), daemon=True)
             pump.start()
             client.settimeout(5)
